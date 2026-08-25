@@ -130,6 +130,7 @@ class Udemy:
         self.id_as_course_name = id_as_course_name
         self.out = out
         self.use_continuous_lecture_numbers = use_continuous_lecture_numbers
+        self.device = None
 
         # Process the chapter filter
         if chapter_filter_raw:
