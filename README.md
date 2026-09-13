@@ -102,11 +102,44 @@ The program can automatically extract them from your browser. You can specify wh
 
 You can now run the program, see the examples below. The course will download to `out_dir`.
 
+## Interactive Mode
+
+For an easier, menu-driven experience, use the interactive wrapper:
+
+```bash
+python3 interactive_udemy.py
+```
+
+Or set up an alias in your `~/.zshrc` or `~/.bashrc`:
+
+```bash
+# For zsh
+udemy() {
+    cd /path/to/udemy-downloader && source venv/bin/activate && python3 interactive_udemy.py "$@"
+}
+
+# Then reload your shell: source ~/.zshrc
+```
+
+The interactive mode provides:
+- Menu-driven interface for selecting download options
+- Step-by-step prompts for course URL, authentication, and settings
+- Helpful instructions for getting bearer token from browser cookies
+- Automatic output directory detection and display
+- Option to open output directory in Finder (macOS)
+
+**Note**: The bearer token is the same as the `access_token` cookie value. To get it:
+1. Open Udemy in your browser
+2. Open Developer Tools (F12 or Cmd+Option+I)
+3. Go to "Application" tab (Chrome) or "Storage" tab (Firefox)
+4. Expand "Cookies" > select your Udemy domain
+5. Find `access_token` cookie and copy its Value
+
 # Advanced Usage
 
 ```
 usage: main.py [-h] -c COURSE_URL [-b BEARER_TOKEN] [-q QUALITY] [-l LANG] [-cd CONCURRENT_DOWNLOADS] [--skip-lectures] [--download-assets]
-               [--download-captions] [--download-quizzes] [--keep-vtt] [--skip-hls] [--info] [--id-as-course-name] [-sc] [--save-to-file] [--load-from-file]
+               [--download-captions] [--download-quizzes] [--keep-vtt] [--skip-hls] [--info] [--curriculum-only] [--id-as-course-name] [-sc] [--save-to-file] [--load-from-file]
                [--log-level LOG_LEVEL] [--browser {chrome,firefox,opera,edge,brave,chromium,vivaldi,safari}] [--use-h265] [--h265-crf H265_CRF] [--h265-preset H265_PRESET]
                [--use-nvenc] [--out OUT] [--continue-lecture-numbers]
                [--chapter CHAPTER_FILTER_RAW]
@@ -132,6 +165,7 @@ options:
   --keep-vtt            If specified, .vtt files won't be removed
   --skip-hls            If specified, hls streams will be skipped (faster fetching) (hls streams usually contain 1080p quality for non-drm lectures)
   --info                If specified, only course information will be printed, nothing will be downloaded
+  --curriculum-only     If specified, only generates curriculum.md file (fast, no detailed lecture parsing)
   --id-as-course-name   If specified, the course id will be used in place of the course name for the output directory. This is a 'hack' to reduce the path length
   -sc, --subscription-course
                         Mark the course as a subscription based course, use this if you are having problems with the program auto detecting it
@@ -182,6 +216,8 @@ options:
     -   `python main.py -c <Course URL> --skip-hls`
 -   Print course information only:
     -   `python main.py -c <Course URL> --info`
+-   Generate curriculum markdown only (fast):
+    -   `python main.py -c <Course URL> --curriculum-only`
 -   Specify max number of concurrent downloads:
     -   `python main.py -c <Course URL> --concurrent-downloads 20`
     -   `python main.py -c <Course URL> -cd 20`
