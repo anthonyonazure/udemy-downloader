@@ -155,6 +155,10 @@ def build_arguments(selections):
     # Browser (if selected)
     if selections.get('browser'):
         args.extend(['--browser', selections['browser']])
+
+    # Cookies file (company / Udemy Business portals)
+    if selections.get('cookie_file'):
+        args.extend(['--cookies', selections['cookie_file']])
     
     # Main action
     if selections['action'] == 'info':
@@ -207,6 +211,12 @@ def build_arguments(selections):
     
     if selections.get('concurrent_downloads'):
         args.extend(['-cd', str(selections['concurrent_downloads'])])
+
+    if selections.get('parallel_lectures', 1) > 1:
+        args.extend(['--parallel-lectures', str(selections['parallel_lectures'])])
+
+    if selections.get('use_mkv'):
+        args.append('--mkv')
     
     if selections.get('use_h265'):
         args.append('--use-h265')
@@ -299,7 +309,7 @@ def main():
     print("\n" + "=" * 60)
     auth_choice = get_menu_choice(
         "Authentication method:",
-        ["Bearer token", "Browser cookies", "Skip (use .env file)"],
+        ["Bearer token", "Browser cookies", "Cookies file (company / Udemy Business portals)", "Skip (use .env file)"],
         default=1
     )
     
@@ -325,6 +335,18 @@ def main():
         if selections['browser'] == 'file':
             print("\nNOTE: When using 'file', cookies should be in Netscape format")
             print("and saved as 'cookies.txt' in the project directory.")
+    elif auth_choice == 3:
+        print("\n" + "-" * 60)
+        print("NOTE: Export your cookies while logged in to your company's Udemy site")
+        print("(for example yourcompany.udemy.com) using a 'cookies.txt' browser extension.")
+        print("The file must be in Netscape format.")
+        print("-" * 60)
+        cookie_path = get_user_input(
+            "Path to cookies.txt",
+            default=os.path.join(script_dir, 'cookies.txt'),
+            required=True
+        )
+        selections['cookie_file'] = os.path.abspath(os.path.expanduser(cookie_path))
     
     # If downloading, get download options
     if selections['action'] == 'download':
@@ -378,6 +400,17 @@ def main():
             except ValueError:
                 pass
         
+        parallel = get_user_input("Lectures to download at the same time (1-8)", default='1', required=False)
+        if parallel:
+            try:
+                selections['parallel_lectures'] = max(1, min(int(parallel), 8))
+            except ValueError:
+                pass
+
+        selections['use_mkv'] = get_yes_no("Save videos as MKV with captions built in?", default=False)
+        if selections['use_mkv'] and not selections.get('download_captions'):
+            print("NOTE: Captions are off, so the MKV files will have no subtitle tracks.")
+
         use_h265 = get_yes_no("Encode with H.265?", default=False)
         if use_h265:
             selections['use_h265'] = True

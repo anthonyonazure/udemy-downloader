@@ -7,7 +7,9 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.cookiejar import MozillaCookieJar
 from pathlib import Path
 from typing import IO, Union
@@ -64,6 +66,9 @@ browser = None
 cj = None
 use_continuous_lecture_numbers = False
 chapter_filter = None
+parallel_lectures = 1
+use_mkv = False
+cookie_file = None
 
 
 def deEmojify(inputStr: str):
@@ -102,7 +107,7 @@ def parse_chapter_filter(chapter_str: str):
 
 # this is the first function that is called, we parse the arguments, setup the logger, and ensure that required directories exist
 def pre_run():
-    global dl_assets, dl_captions, dl_quizzes, skip_lectures, caption_locale, quality, bearer_token, course_name, keep_vtt, skip_hls, concurrent_downloads, load_from_file, save_to_file, bearer_token, course_url, info, curriculum_only, logger, keys, id_as_course_name, LOG_LEVEL, use_h265, h265_crf, h265_preset, use_nvenc, browser, is_subscription_course, DOWNLOAD_DIR, use_continuous_lecture_numbers, chapter_filter
+    global dl_assets, dl_captions, dl_quizzes, skip_lectures, caption_locale, quality, bearer_token, course_name, keep_vtt, skip_hls, concurrent_downloads, load_from_file, save_to_file, bearer_token, course_url, info, curriculum_only, logger, keys, id_as_course_name, LOG_LEVEL, use_h265, h265_crf, h265_preset, use_nvenc, browser, is_subscription_course, DOWNLOAD_DIR, use_continuous_lecture_numbers, chapter_filter, parallel_lectures, use_mkv, cookie_file
 
     # make sure the logs directory exists
     if not os.path.exists(LOG_DIR_PATH):
@@ -286,6 +291,26 @@ def pre_run():
         type=str,
         help="Download specific chapters. Use comma separated values and ranges (e.g., '1,3-5,7,9-11').",
     )
+    parser.add_argument(
+        "--parallel-lectures",
+        "-pl",
+        dest="parallel_lectures",
+        type=int,
+        default=1,
+        help="Number of lectures to download at the same time (1-8). Default is 1",
+    )
+    parser.add_argument(
+        "--mkv",
+        dest="use_mkv",
+        action="store_true",
+        help="Save video lectures as MKV with downloaded captions embedded as subtitle tracks",
+    )
+    parser.add_argument(
+        "--cookies",
+        dest="cookie_file",
+        type=str,
+        help="Path to a Netscape format cookies.txt file. Use this for company (Udemy Business) portals",
+    )
     # parser.add_argument("-v", "--version", action="version", version="You are running version {version}".format(version=__version__))
 
     args = parser.parse_args()
@@ -358,6 +383,12 @@ def pre_run():
         DOWNLOAD_DIR = os.path.abspath(args.out)
     if args.use_continuous_lecture_numbers:
         use_continuous_lecture_numbers = args.use_continuous_lecture_numbers
+    parallel_lectures = max(1, min(args.parallel_lectures, 8))
+    if args.use_mkv:
+        use_mkv = True
+    if args.cookie_file:
+        cookie_file = os.path.abspath(os.path.expanduser(args.cookie_file))
+        browser = "file"
 
     # setup a logger
     logger = logging.getLogger(__name__)
@@ -387,6 +418,9 @@ def pre_run():
 
     Path(DOWNLOAD_DIR).mkdir(parents=True, exist_ok=True)
     Path(SAVED_DIR).mkdir(parents=True, exist_ok=True)
+
+    if use_mkv and not dl_captions:
+        logger.warning("> --mkv was specified without --download-captions, MKV files will have no subtitle tracks")
 
     # Get the keys
     if os.path.exists(KEY_FILE_PATH):
@@ -440,12 +474,27 @@ class Udemy:
                     cj = browser_cookie3.chromium(domain_name="udemy.com")
                 elif browser == "vivaldi":
                     cj = browser_cookie3.vivaldi(domain_name="udemy.com")
+                elif browser == "safari":
+                    cj = browser_cookie3.safari(domain_name="udemy.com")
                 elif browser == "file":
                     # load netscape cookies from file
-                    cj = MozillaCookieJar("cookies.txt")
+                    cj = MozillaCookieJar(cookie_file or COOKIE_FILE_PATH)
                     cj.load()
 
                 self.session._session.cookies.update(cj)
+
+                if portal_name != "www":
+                    # company (Udemy Business) portals reject requests that mix browser cookies
+                    # with the Android app client headers, so send the cookies on their own
+                    for header in [
+                        "x-udemy-client-secret",
+                        "x-udemy-client-id",
+                        "x-mobile-visit-enabled",
+                        "x-version-name",
+                        "x-client-name",
+                    ]:
+                        self.session._session.headers.pop(header, None)
+                    logger.info(f"> Using cookie login for company portal '{portal_name}'")
 
             # remove the authentication header
             del self.session._session.headers["authorization"]
@@ -1227,6 +1276,8 @@ class Udemy:
 class Session(object):
     def __init__(self):
         self._session = requests2.Session(impersonate="chrome120")
+        # curl_cffi sessions are not thread-safe, serialize API calls when lectures download in parallel
+        self._lock = threading.Lock()
         headers = HEADERS.copy()
         if "User-Agent" in headers:
             del headers["User-Agent"]
@@ -1273,12 +1324,14 @@ class Session(object):
         if "timeout" not in kwargs:
             kwargs["timeout"] = 120
 
-        return self._session.get(url, **kwargs)
+        with self._lock:
+            return self._session.get(url, **kwargs)
 
     def _post(self, url, data=None, **kwargs):
         if data:
             kwargs["data"] = data
-        return self._session.post(url, **kwargs)
+        with self._lock:
+            return self._session.post(url, **kwargs)
 
     def terminate(self):
         self._session.close()
@@ -1369,10 +1422,8 @@ def mux_process(
 
 
 def handle_segments(url, format_id, lecture_id, video_title, output_path, chapter_dir):
-    os.chdir(os.path.join(chapter_dir))
-
-    video_filepath_enc = lecture_id + ".encrypted.mp4"
-    audio_filepath_enc = lecture_id + ".encrypted.m4a"
+    video_filepath_enc = os.path.join(chapter_dir, lecture_id + ".encrypted.mp4")
+    audio_filepath_enc = os.path.join(chapter_dir, lecture_id + ".encrypted.m4a")
     temp_output_path = os.path.join(chapter_dir, lecture_id + ".mp4")
 
     logger.info("> Downloading Lecture Tracks...")
@@ -1389,6 +1440,8 @@ def handle_segments(url, format_id, lecture_id, video_title, output_path, chapte
         "--fixup",
         "never",
         "-k",
+        "-P",
+        chapter_dir,
         "-o",
         f"{lecture_id}.encrypted.%(ext)s",
         "-f",
@@ -1473,7 +1526,6 @@ def handle_segments(url, format_id, lecture_id, video_title, output_path, chapte
     except Exception as e:
         logger.exception(f"Muxing error: {e}")
     finally:
-        os.chdir(HOME_DIR)
         # if the url is a file url, we need to remove the file after we're done with it
         if url.startswith("file://"):
             try:
@@ -2264,6 +2316,246 @@ def generate_curriculum_markdown(udemy: Udemy, udemy_object: dict, course_dir: s
         logger.exception("Curriculum markdown generation error")
 
 
+MKV_LANGUAGES = {
+    "en": "eng", "english": "eng", "es": "spa", "spanish": "spa", "pt": "por", "portuguese": "por",
+    "fr": "fra", "french": "fra", "de": "deu", "german": "deu", "it": "ita", "italian": "ita",
+    "ja": "jpn", "japanese": "jpn", "ko": "kor", "korean": "kor", "zh": "zho", "chinese": "zho",
+    "ru": "rus", "russian": "rus", "ar": "ara", "arabic": "ara", "hi": "hin", "hindi": "hin",
+    "tr": "tur", "turkish": "tur", "pl": "pol", "polish": "pol", "nl": "nld", "dutch": "nld",
+    "id": "ind", "indonesian": "ind", "vi": "vie", "vietnamese": "vie",
+}
+
+
+def mkv_language_code(language):
+    """Best effort ISO 639-2 code for a Udemy caption language such as 'en_US' or 'English [Auto]'."""
+    base = re.split(r"[_\-\s\[\(]", (language or "").strip().lower())[0]
+    if base in MKV_LANGUAGES:
+        return MKV_LANGUAGES[base]
+    if len(base) == 3 and base.isalpha():
+        return base
+    return "und"
+
+
+def embed_subtitles_mkv(video_path, mkv_path, lecture_title, chapter_dir, subtitles):
+    """Remux a downloaded lecture into MKV with its SRT captions as subtitle tracks, then remove the loose files."""
+    srt_files = []
+    for subtitle in subtitles:
+        lang = subtitle.get("language")
+        if lang != caption_locale and caption_locale != "all":
+            continue
+        srt_path = os.path.join(chapter_dir, "%s_%s.srt" % (sanitize_filename(lecture_title), lang))
+        if os.path.isfile(srt_path) and all(path != srt_path for path, _ in srt_files):
+            srt_files.append((srt_path, lang))
+
+    tmp_path = mkv_path + ".part"
+    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", video_path]
+    for srt_path, _ in srt_files:
+        cmd += ["-i", srt_path]
+    cmd += ["-map", "0:v?", "-map", "0:a?"]
+    for i, (_, lang) in enumerate(srt_files):
+        cmd += [
+            "-map", f"{i + 1}:0",
+            f"-metadata:s:s:{i}", f"language={mkv_language_code(lang)}",
+            f"-metadata:s:s:{i}", f"title={lang}",
+        ]
+    cmd += ["-c", "copy", "-c:s", "srt", "-f", "matroska", tmp_path]
+
+    logger.info(f"      > Creating MKV with {len(srt_files)} subtitle track(s)...")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0 or not os.path.isfile(tmp_path):
+        logger.error(f"      > MKV remux failed, keeping the MP4: {result.stderr.strip()[-500:]}")
+        if os.path.isfile(tmp_path):
+            os.remove(tmp_path)
+        return False
+
+    os.replace(tmp_path, mkv_path)
+    os.remove(video_path)
+    for srt_path, _ in srt_files:
+        os.remove(srt_path)
+    logger.info("      > MKV created")
+    return True
+
+
+def process_lecture_item(udemy: Udemy, udemy_object: dict, lecture: dict, chapter_dir: str):
+    total_lectures = udemy_object.get("total_lectures")
+    clazz = lecture.get("_class")
+
+    if clazz == "quiz":
+        # skip the quiz if we dont want to download it
+        if not dl_quizzes:
+            return
+        process_quiz(udemy, lecture, chapter_dir)
+        return
+
+    elif clazz == "practice":
+        if not dl_quizzes:
+            return
+        process_practice(udemy, lecture, chapter_dir, udemy_object.get("course_id"))
+
+    if clazz == "role-play":
+        if not dl_quizzes:
+            return
+        process_role_play(udemy, lecture, chapter_dir)
+        return
+
+    index = lecture.get("index")  # this is lecture_counter
+    # lecture_index = lecture.get("lecture_index")  # this is the raw object index from udemy
+
+    lecture_title = lecture.get("lecture_title")
+    parsed_lecture = udemy._parse_lecture(lecture)
+
+    lecture_extension = parsed_lecture.get("extension")
+    extension = "mp4"  # video lectures dont have an extension property, so we assume its mp4
+    if lecture_extension != None:
+        # if the lecture extension property isnt none, set the extension to the lecture extension
+        extension = lecture_extension
+    lecture_file_name = sanitize_filename(lecture_title + "." + extension)
+    lecture_file_name = deEmojify(lecture_file_name)
+    lecture_path = os.path.join(chapter_dir, lecture_file_name)
+
+    mkv_path = os.path.splitext(lecture_path)[0] + ".mkv"
+    already_mkv = use_mkv and lecture_extension == None and os.path.isfile(mkv_path)
+    if already_mkv and not skip_lectures:
+        logger.info("      > Lecture '%s' is already downloaded as MKV, skipping..." % lecture_title)
+
+    if not skip_lectures and not already_mkv:
+        logger.info(f"  > Processing lecture {index} of {total_lectures}")
+
+        # Check if the lecture is already downloaded
+        if os.path.isfile(lecture_path):
+            logger.info(
+                "      > Lecture '%s' is already downloaded, skipping..."
+                % lecture_title
+            )
+        else:
+            # Check if the file is an html file
+            if extension == "html":
+                # if the html content is None or an empty string, skip it so we dont save empty html files
+                if (
+                    parsed_lecture.get("html_content") != None
+                    and parsed_lecture.get("html_content") != ""
+                ):
+                    html_content = (
+                        parsed_lecture.get("html_content")
+                        .encode("utf8", "ignore")
+                        .decode("utf8")
+                    )
+                    lecture_path = os.path.join(
+                        chapter_dir,
+                        "{}.html".format(sanitize_filename(lecture_title)),
+                    )
+                    try:
+                        with open(lecture_path, encoding="utf8", mode="w") as f:
+                            f.write(html_content)
+                    except Exception:
+                        logger.exception("    > Failed to write html file")
+            else:
+                process_lecture(parsed_lecture, lecture_path, chapter_dir)
+
+    # download subtitles for this lecture
+    subtitles = parsed_lecture.get("subtitles")
+    if dl_captions and subtitles != None and lecture_extension == None and not already_mkv:
+        logger.info("Processing {} caption(s)...".format(len(subtitles)))
+        for subtitle in subtitles:
+            lang = subtitle.get("language")
+            if lang == caption_locale or caption_locale == "all":
+                process_caption(subtitle, lecture_title, chapter_dir)
+
+    if use_mkv and not already_mkv and lecture_extension == None and os.path.isfile(lecture_path):
+        embed_subtitles_mkv(
+            lecture_path,
+            mkv_path,
+            lecture_title,
+            chapter_dir,
+            (subtitles or []) if dl_captions else [],
+        )
+
+    if dl_assets:
+        assets = parsed_lecture.get("assets")
+        logger.info(
+            "    > Processing {} asset(s) for lecture...".format(len(assets))
+        )
+
+        for asset in assets:
+            asset_type = asset.get("type")
+            filename = asset.get("filename")
+            download_url = asset.get("download_url")
+
+            if asset_type == "article":
+                body = asset.get("body")
+                # stip the 03d prefix
+                lecture_path = os.path.join(
+                    chapter_dir,
+                    "{}.html".format(sanitize_filename(lecture_title)),
+                )
+                try:
+                    template_path = os.path.join(
+                        MAIN_SCRIPT_PATH, "templates", "article_template.html"
+                    )
+                    with open(template_path, "r") as f:
+                        content = f.read()
+                        content = content.replace(
+                            "__title_placeholder__", lecture_title[4:]
+                        )
+                        content = content.replace("__data_placeholder__", body)
+                        with open(lecture_path, encoding="utf8", mode="w") as f:
+                            f.write(content)
+                except Exception as e:
+                    print("Failed to write html file: ", e)
+                    continue
+            elif asset_type == "video":
+                logger.warning(
+                    "If you're seeing this message, that means that you reached a secret area that I haven't finished! jk I haven't implemented handling for this asset type, please report this at https://github.com/Puyodead1/udemy-downloader/issues so I can add it. When reporting, please provide the following information: "
+                )
+                logger.warning("AssetType: Video; AssetData: ", asset)
+            elif (
+                asset_type == "audio"
+                or asset_type == "e-book"
+                or asset_type == "file"
+                or asset_type == "presentation"
+                or asset_type == "ebook"
+                or asset_type == "source_code"
+            ):
+                try:
+                    ret_code = download_aria(
+                        download_url, chapter_dir, filename
+                    )
+                    logger.debug(f"      > Download return code: {ret_code}")
+                except Exception:
+                    logger.exception("> Error downloading asset")
+            elif asset_type == "external_link":
+                # write the external link to a shortcut file
+                file_path = os.path.join(chapter_dir, f"{filename}.url")
+                file = open(file_path, "w")
+                file.write("[InternetShortcut]\n")
+                file.write(f"URL={download_url}")
+                file.close()
+
+                # save all the external links to a single file
+                savedirs, name = os.path.split(
+                    os.path.join(chapter_dir, filename)
+                )
+                filename = "external-links.txt"
+                filename = os.path.join(savedirs, filename)
+                file_data = []
+                if os.path.isfile(filename):
+                    file_data = [
+                        i.strip().lower()
+                        for i in open(
+                            filename, encoding="utf-8", errors="ignore"
+                        )
+                        if i
+                    ]
+
+                content = "\n{}\n{}\n".format(name, download_url)
+                if name.lower() not in file_data:
+                    with open(
+                        filename, "a", encoding="utf-8", errors="ignore"
+                    ) as f:
+                        f.write(content)
+
+
+
 def parse_new(udemy: Udemy, udemy_object: dict):
     total_chapters = udemy_object.get("total_chapters")
     total_lectures = udemy_object.get("total_lectures")
@@ -2279,6 +2571,7 @@ def parse_new(udemy: Udemy, udemy_object: dict):
     if not os.path.exists(course_dir):
         os.mkdir(course_dir)
 
+    lecture_jobs = []
     for chapter in udemy_object.get("chapters"):
         current_chapter_index = int(chapter.get("chapter_index"))
         # Skip chapters not in the filter if a filter is provided
@@ -2299,167 +2592,23 @@ def parse_new(udemy: Udemy, udemy_object: dict):
         )
 
         for lecture in chapter.get("lectures"):
-            clazz = lecture.get("_class")
+            if parallel_lectures > 1:
+                lecture_jobs.append((lecture, chapter_dir))
+            else:
+                process_lecture_item(udemy, udemy_object, lecture, chapter_dir)
 
-            if clazz == "quiz":
-                # skip the quiz if we dont want to download it
-                if not dl_quizzes:
-                    continue
-                process_quiz(udemy, lecture, chapter_dir)
-                continue
-                
-            elif clazz == "practice":
-                if not dl_quizzes:
-                    continue
-                process_practice(udemy, lecture, chapter_dir, udemy_object.get("course_id"))
-            
-            if clazz == "role-play":
-                if not dl_quizzes:
-                    continue
-                process_role_play(udemy, lecture, chapter_dir)
-                continue
-
-            index = lecture.get("index")  # this is lecture_counter
-            # lecture_index = lecture.get("lecture_index")  # this is the raw object index from udemy
-
-            lecture_title = lecture.get("lecture_title")
-            parsed_lecture = udemy._parse_lecture(lecture)
-
-            lecture_extension = parsed_lecture.get("extension")
-            extension = "mp4"  # video lectures dont have an extension property, so we assume its mp4
-            if lecture_extension != None:
-                # if the lecture extension property isnt none, set the extension to the lecture extension
-                extension = lecture_extension
-            lecture_file_name = sanitize_filename(lecture_title + "." + extension)
-            lecture_file_name = deEmojify(lecture_file_name)
-            lecture_path = os.path.join(chapter_dir, lecture_file_name)
-
-            if not skip_lectures:
-                logger.info(f"  > Processing lecture {index} of {total_lectures}")
-
-                # Check if the lecture is already downloaded
-                if os.path.isfile(lecture_path):
-                    logger.info(
-                        "      > Lecture '%s' is already downloaded, skipping..."
-                        % lecture_title
-                    )
-                else:
-                    # Check if the file is an html file
-                    if extension == "html":
-                        # if the html content is None or an empty string, skip it so we dont save empty html files
-                        if (
-                            parsed_lecture.get("html_content") != None
-                            and parsed_lecture.get("html_content") != ""
-                        ):
-                            html_content = (
-                                parsed_lecture.get("html_content")
-                                .encode("utf8", "ignore")
-                                .decode("utf8")
-                            )
-                            lecture_path = os.path.join(
-                                chapter_dir,
-                                "{}.html".format(sanitize_filename(lecture_title)),
-                            )
-                            try:
-                                with open(lecture_path, encoding="utf8", mode="w") as f:
-                                    f.write(html_content)
-                            except Exception:
-                                logger.exception("    > Failed to write html file")
-                    else:
-                        process_lecture(parsed_lecture, lecture_path, chapter_dir)
-
-            # download subtitles for this lecture
-            subtitles = parsed_lecture.get("subtitles")
-            if dl_captions and subtitles != None and lecture_extension == None:
-                logger.info("Processing {} caption(s)...".format(len(subtitles)))
-                for subtitle in subtitles:
-                    lang = subtitle.get("language")
-                    if lang == caption_locale or caption_locale == "all":
-                        process_caption(subtitle, lecture_title, chapter_dir)
-
-            if dl_assets:
-                assets = parsed_lecture.get("assets")
-                logger.info(
-                    "    > Processing {} asset(s) for lecture...".format(len(assets))
-                )
-
-                for asset in assets:
-                    asset_type = asset.get("type")
-                    filename = asset.get("filename")
-                    download_url = asset.get("download_url")
-
-                    if asset_type == "article":
-                        body = asset.get("body")
-                        # stip the 03d prefix
-                        lecture_path = os.path.join(
-                            chapter_dir,
-                            "{}.html".format(sanitize_filename(lecture_title)),
-                        )
-                        try:
-                            template_path = os.path.join(
-                                MAIN_SCRIPT_PATH, "templates", "article_template.html"
-                            )
-                            with open(template_path, "r") as f:
-                                content = f.read()
-                                content = content.replace(
-                                    "__title_placeholder__", lecture_title[4:]
-                                )
-                                content = content.replace("__data_placeholder__", body)
-                                with open(lecture_path, encoding="utf8", mode="w") as f:
-                                    f.write(content)
-                        except Exception as e:
-                            print("Failed to write html file: ", e)
-                            continue
-                    elif asset_type == "video":
-                        logger.warning(
-                            "If you're seeing this message, that means that you reached a secret area that I haven't finished! jk I haven't implemented handling for this asset type, please report this at https://github.com/Puyodead1/udemy-downloader/issues so I can add it. When reporting, please provide the following information: "
-                        )
-                        logger.warning("AssetType: Video; AssetData: ", asset)
-                    elif (
-                        asset_type == "audio"
-                        or asset_type == "e-book"
-                        or asset_type == "file"
-                        or asset_type == "presentation"
-                        or asset_type == "ebook"
-                        or asset_type == "source_code"
-                    ):
-                        try:
-                            ret_code = download_aria(
-                                download_url, chapter_dir, filename
-                            )
-                            logger.debug(f"      > Download return code: {ret_code}")
-                        except Exception:
-                            logger.exception("> Error downloading asset")
-                    elif asset_type == "external_link":
-                        # write the external link to a shortcut file
-                        file_path = os.path.join(chapter_dir, f"{filename}.url")
-                        file = open(file_path, "w")
-                        file.write("[InternetShortcut]\n")
-                        file.write(f"URL={download_url}")
-                        file.close()
-
-                        # save all the external links to a single file
-                        savedirs, name = os.path.split(
-                            os.path.join(chapter_dir, filename)
-                        )
-                        filename = "external-links.txt"
-                        filename = os.path.join(savedirs, filename)
-                        file_data = []
-                        if os.path.isfile(filename):
-                            file_data = [
-                                i.strip().lower()
-                                for i in open(
-                                    filename, encoding="utf-8", errors="ignore"
-                                )
-                                if i
-                            ]
-
-                        content = "\n{}\n{}\n".format(name, download_url)
-                        if name.lower() not in file_data:
-                            with open(
-                                filename, "a", encoding="utf-8", errors="ignore"
-                            ) as f:
-                                f.write(content)
+    if lecture_jobs:
+        logger.info(f"> Downloading {len(lecture_jobs)} items, up to {parallel_lectures} at the same time")
+        with ThreadPoolExecutor(max_workers=parallel_lectures) as executor:
+            futures = {
+                executor.submit(process_lecture_item, udemy, udemy_object, lecture, chapter_dir): lecture
+                for lecture, chapter_dir in lecture_jobs
+            }
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception:
+                    logger.exception(f"> Error processing '{futures[future].get('lecture_title')}'")
 
 
 def _print_course_info(udemy: Udemy, udemy_object: dict):

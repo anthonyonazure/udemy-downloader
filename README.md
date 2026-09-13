@@ -142,7 +142,7 @@ usage: main.py [-h] -c COURSE_URL [-b BEARER_TOKEN] [-q QUALITY] [-l LANG] [-cd 
                [--download-captions] [--download-quizzes] [--keep-vtt] [--skip-hls] [--info] [--curriculum-only] [--id-as-course-name] [-sc] [--save-to-file] [--load-from-file]
                [--log-level LOG_LEVEL] [--browser {chrome,firefox,opera,edge,brave,chromium,vivaldi,safari}] [--use-h265] [--h265-crf H265_CRF] [--h265-preset H265_PRESET]
                [--use-nvenc] [--out OUT] [--continue-lecture-numbers]
-               [--chapter CHAPTER_FILTER_RAW]
+               [--chapter CHAPTER_FILTER_RAW] [--parallel-lectures PARALLEL_LECTURES] [--mkv] [--cookies COOKIE_FILE]
 
 Udemy Downloader
 
@@ -187,6 +187,11 @@ options:
                         Use continuous lecture numbering instead of per-chapter
   --chapter CHAPTER_FILTER_RAW
                         Download specific chapters. Use comma separated values and ranges (e.g., '1,3-5,7,9-11')
+  --parallel-lectures PARALLEL_LECTURES, -pl PARALLEL_LECTURES
+                        Number of lectures to download at the same time (1-8). Default is 1
+  --mkv                 Save video lectures as MKV with downloaded captions embedded as subtitle tracks
+  --cookies COOKIE_FILE
+                        Path to a Netscape format cookies.txt file. Use this for company (Udemy Business) portals
 ```
 
 -   Passing a Bearer Token and Course ID as an argument
@@ -251,6 +256,12 @@ options:
     - `python main.py -c <Course URL> --chapter "1-3" -q 720`
 -   Download specific chapters with captions:
     - `python main.py -c <Course URL> --chapter "1,3" --download-captions`
+-   Download 4 lectures at the same time:
+    -   `python main.py -c <Course URL> --parallel-lectures 4`
+-   Save videos as MKV with all caption languages built in:
+    -   `python main.py -c <Course URL> --download-captions -l all --mkv`
+-   Download from a company (Udemy Business) portal with exported cookies:
+    -   `python main.py -c https://yourcompany.udemy.com/course/<course-slug>/ --cookies /path/to/cookies.txt`
 
 # Support
 
